@@ -25,6 +25,8 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
+# Never read or write the real saved progress, even at import time.
+os.environ.setdefault("PDF_CLEANER_DATA_DIR", tempfile.mkdtemp(prefix="pdfcleaner-testdata-"))
 
 import server  # noqa: E402
 from sample_pdfs import make_objstm_pdf, make_pdf  # noqa: E402

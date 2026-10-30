@@ -34,6 +34,13 @@ env/
 .coverage
 htmlcov/
 
+# Build output (PDFCleaner.exe is attached to GitHub Releases, never committed)
+build/
+dist/
+*.spec
+*.exe
+*.zip
+
 # ---------------------------------------------------------------------------
 # Temporary and editor files
 # ---------------------------------------------------------------------------

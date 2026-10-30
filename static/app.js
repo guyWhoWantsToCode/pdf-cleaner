@@ -50,7 +50,21 @@
     dialog: $('#confirmDialog'), confirmName: $('#confirmName'), confirmPath: $('#confirmPath'),
     btnConfirmDelete: $('#btnConfirmDelete'), btnCancelDelete: $('#btnCancelDelete'),
     busy: $('#busy'), busyText: $('#busyText'), toasts: $('#toasts'),
+    btnReveal: $('#btnReveal'), btnRevealBar: $('#btnRevealBar'), appVersion: $('#appVersion'),
+    btnDupes: $('#btnDupes'), dupDialog: $('#dupDialog'), btnDupClose: $('#btnDupClose'),
+    dupProgress: $('#dupProgress'), dupProgressText: $('#dupProgressText'), dupBar: $('#dupBar'),
+    btnDupCancel: $('#btnDupCancel'), dupEmpty: $('#dupEmpty'), dupReport: $('#dupReport'),
+    dupToolbar: $('#dupToolbar'), dupSummary: $('#dupSummary'), btnDupSuggest: $('#btnDupSuggest'),
+    btnDupKeepAll: $('#btnDupKeepAll'), dupGroups: $('#dupGroups'), dupFoot: $('#dupFoot'),
+    dupFootNote: $('#dupFootNote'), btnDupRescan: $('#btnDupRescan'), btnDupDelete: $('#btnDupDelete'),
+    dupConfirmDialog: $('#dupConfirmDialog'), dupConfirmLead: $('#dupConfirmLead'),
+    dupConfirmList: $('#dupConfirmList'), btnDupConfirm: $('#btnDupConfirm'),
+    btnDupConfirmCancel: $('#btnDupConfirmCancel'),
   };
+
+  // Duplicate finder. `keep` holds the ids the user chose to keep; everything else in a group
+  // would be recycled. Nothing happens until the user confirms.
+  const dup = { groups: [], keep: new Set(), polling: false, root: null, report: null };
 
   // ------------------------------------------------------------------ helpers
 
@@ -91,7 +105,14 @@
   const current = () => (state.currentId ? state.byId.get(state.currentId) : null);
   const joinPath = (root, rel) => root.replace(/[\\/]+$/, '') + '\\' + rel;
 
+  // Modal dialogs sit above the rest of the page, so overlays go inside the topmost open one.
+  function raise(node) {
+    const host = [...document.querySelectorAll('dialog[open]')].pop() || document.body;
+    if (node.parentNode !== host) host.appendChild(node);
+  }
+
   function toast(message, kind = 'info', opts = {}) {
+    raise(el.toasts);
     const t = document.createElement('div');
     t.className = 'toast' + (kind === 'error' ? ' error' : '');
     t.setAttribute('role', kind === 'error' ? 'alert' : 'status');
@@ -121,6 +142,7 @@
   }
 
   function setBusy(on, text) {
+    if (on) raise(el.busy);
     el.busy.hidden = !on;
     if (text) el.busyText.textContent = text;
   }
@@ -178,6 +200,7 @@
     }
     const n = state.view.length, total = state.files.length;
     el.listMeta.textContent = n === total ? `${total} file${total === 1 ? '' : 's'}` : `Showing ${n} of ${total}`;
+    el.btnDupes.hidden = state.files.filter((f) => !f.ghost).length < 2;
   }
 
   function renderProgress() {
@@ -245,6 +268,7 @@
       el.details.hidden = true;
       el.viewerTitle.textContent = '';
       el.btnOpenTab.hidden = true;
+      el.btnRevealBar.hidden = true;
       if (state.root) {
         showViewerMessage(state.files.length ? 'Nothing selected' : 'No PDFs found',
           state.files.length ? 'Pick a file from the list, or change the search or filter.'
@@ -256,6 +280,8 @@
 
     document.title = `${f.name} · PDF Cleaner`;
     el.viewerTitle.textContent = f.name;
+    el.btnRevealBar.hidden = !!f.ghost;
+    el.btnReveal.hidden = !!f.ghost;
     if (f.ghost) {
       el.btnOpenTab.hidden = true;
       showViewerMessage('This file is in the Recycle Bin',
@@ -432,6 +458,265 @@
     }
   }
 
+  // ------------------------------------------------------------------ show in folder
+
+  async function reveal(id) {
+    const f = id ? state.byId.get(id) : current();
+    if (!f || f.ghost) return;
+    try {
+      await api('/api/reveal', { id: f.id });
+      toast(`Opened in File Explorer: ${f.name}. If you don't see it, check the taskbar.`);
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  }
+
+  // ------------------------------------------------------------------ duplicate finder
+
+  const anyDialogOpen = () => !!document.querySelector('dialog[open]');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Suggest the oldest copy (then the shortest path) as the one to keep.
+  function suggestedKeeper(ids) {
+    const files = ids.map((id) => state.byId.get(id)).filter(Boolean);
+    files.sort((a, b) => (a.mtime ?? 0) - (b.mtime ?? 0) || a.rel.length - b.rel.length
+      || a.rel.localeCompare(b.rel));
+    return files[0] ? files[0].id : ids[0];
+  }
+
+  // Group members still present in this scan (a file recycled on its own drops out).
+  const liveIds = (g) => g.ids.filter((id) => { const f = state.byId.get(id); return f && !f.ghost; });
+
+  function toRemove() {
+    const out = [];
+    for (const g of dup.groups) {
+      const ids = liveIds(g);
+      if (ids.length < 2 || !ids.some((id) => dup.keep.has(id))) continue;
+      for (const id of ids) if (!dup.keep.has(id)) out.push(id);
+    }
+    return out;
+  }
+
+  function openDuplicates() {
+    if (!state.root) return;
+    if (!el.dupDialog.open) el.dupDialog.showModal();
+    if (dup.root !== state.root || !dup.groups.length) startDuplicateSearch();
+    else renderDuplicates();
+  }
+
+  async function startDuplicateSearch() {
+    dup.groups = []; dup.keep = new Set(); dup.report = null; dup.root = state.root;
+    showDupSection('progress');
+    el.dupProgressText.textContent = 'Checking file sizes…';
+    el.dupBar.style.width = '0%';
+    try {
+      await api('/api/duplicates/start');
+      pollDuplicates();
+    } catch (e) {
+      showDupSection('empty', e.message);
+    }
+  }
+
+  async function pollDuplicates() {
+    if (dup.polling) return;
+    dup.polling = true;
+    try {
+      for (;;) {
+        const s = await api('/api/duplicates/status');
+        if (s.stale) { showDupSection('empty', 'The folder was scanned again. Click Search again.'); return; }
+        if (s.state === 'running') {
+          const pct = s.bytesTotal ? Math.min(100, Math.round(100 * s.bytesDone / s.bytesTotal)) : 0;
+          el.dupBar.style.width = pct + '%';
+          el.dupProgressText.textContent = s.phase === 'hashing'
+            ? `Comparing contents: ${s.filesDone} of ${s.filesTotal} files with matching sizes (${pct}%)`
+            : 'Checking file sizes…';
+          await sleep(350);
+          continue;
+        }
+        if (s.state === 'done') {
+          dup.groups = s.groups;
+          dup.keep = new Set(s.groups.map((g) => suggestedKeeper(g.ids)));
+          dup.stats = s;
+          renderDuplicates();
+        } else if (s.state === 'cancelled') {
+          showDupSection('empty', 'Search stopped. Nothing was changed.');
+        } else if (s.state === 'error') {
+          showDupSection('empty', s.error || 'Finding duplicates failed.');
+        } else {
+          showDupSection('empty', 'Click Search again to look for duplicates.');
+        }
+        return;
+      }
+    } catch (e) {
+      showDupSection('empty', e.message);
+    } finally {
+      dup.polling = false;
+    }
+  }
+
+  function showDupSection(which, message) {
+    el.dupProgress.hidden = which !== 'progress';
+    el.dupEmpty.hidden = which !== 'empty';
+    el.dupToolbar.hidden = which !== 'groups';
+    el.dupGroups.hidden = which !== 'groups';
+    el.dupFoot.hidden = which === 'progress';
+    el.btnDupDelete.hidden = which !== 'groups';
+    if (which !== 'groups') { el.dupGroups.innerHTML = ''; el.dupFootNote.textContent = ''; }
+    if (which === 'empty') el.dupEmpty.textContent = message || '';
+    el.dupReport.hidden = !dup.report;
+  }
+
+  function renderDuplicates() {
+    const groups = dup.groups.filter((g) => liveIds(g).length > 1);
+    for (const g of groups) {  // every group always keeps at least one live copy
+      const ids = liveIds(g);
+      if (!ids.some((id) => dup.keep.has(id))) dup.keep.add(suggestedKeeper(ids));
+    }
+    renderDupReport();
+    if (!groups.length) {
+      const s = dup.stats || {};
+      let msg = dup.report ? 'No duplicates are left in this folder.'
+        : `No duplicates found. Every PDF in this folder has different contents.`;
+      if (s.skippedCloud) msg += ` ${s.skippedCloud} online-only OneDrive file${s.skippedCloud === 1 ? ' was' : 's were'} skipped so nothing had to be downloaded.`;
+      if (s.unreadable) msg += ` ${s.unreadable} file${s.unreadable === 1 ? '' : 's'} couldn't be read.`;
+      showDupSection('empty', msg);
+      return;
+    }
+    showDupSection('groups');
+    el.dupGroups.innerHTML = groups.map((g, gi) => {
+      const ids = liveIds(g);
+      const rows = ids.map((id) => {
+        const f = state.byId.get(id);
+        const keep = dup.keep.has(id);
+        return `<li class="dup-file${keep ? '' : ' remove'}" data-id="${id}">`
+          + `<label class="dup-keep"><input type="checkbox" data-keep="${id}"${keep ? ' checked' : ''}> Keep</label>`
+          + `<div class="dup-info"><span class="name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>`
+          + `<span class="path" title="${escapeHtml(joinPath(state.root, f.rel))}">${escapeHtml(f.folder === '.' ? '(top folder)' : f.folder)}</span>`
+          + `<span class="sub">Modified ${escapeHtml(fmtDate(f.mtime))}</span></div>`
+          + `<span class="dup-tag ${keep ? 'keep' : 'del'}">${keep ? 'Keep' : 'To Recycle Bin'}</span>`
+          + `<span class="dup-btns"><button type="button" class="btn ghost small" data-view="${id}">View</button>`
+          + `<button type="button" class="btn ghost small" data-reveal="${id}">Show in folder</button></span></li>`;
+      }).join('');
+      return `<section class="dup-group" data-group="${gi}"><header>`
+        + `<strong>${ids.length} identical copies</strong><span>${fmtSize(g.size)} each</span>`
+        + `<span class="hash" title="SHA-256: ${g.sha256}">SHA-256 ${g.sha256.slice(0, 12)}…</span>`
+        + `</header><ul>${rows}</ul></section>`;
+    }).join('');
+    updateDupSummary(groups);
+  }
+
+  function updateDupSummary(groups = dup.groups.filter((g) => liveIds(g).length > 1)) {
+    const extra = groups.reduce((n, g) => n + liveIds(g).length - 1, 0);
+    const wasted = groups.reduce((n, g) => n + g.size * (liveIds(g).length - 1), 0);
+    el.dupSummary.textContent = `${groups.length} group${groups.length === 1 ? '' : 's'} · ${extra} extra cop${extra === 1 ? 'y' : 'ies'} · ${fmtSize(wasted)} could be freed`;
+    const remove = toRemove();
+    const bytes = remove.reduce((n, id) => n + (state.byId.get(id).size || 0), 0);
+    el.btnDupDelete.disabled = !remove.length;
+    el.btnDupDelete.textContent = remove.length
+      ? `Move ${remove.length} cop${remove.length === 1 ? 'y' : 'ies'} to Recycle Bin`
+      : 'Move copies to Recycle Bin';
+    el.dupFootNote.textContent = remove.length ? `Frees ${fmtSize(bytes)}. Asks you first.` : 'Untick Keep on the copies you don’t need.';
+  }
+
+  function renderDupReport() {
+    const r = dup.report;
+    if (!r) { el.dupReport.hidden = true; el.dupReport.innerHTML = ''; return; }
+    const item = (x, why) => {
+      const f = state.byId.get(x.id);
+      const label = x.rel || (f && f.rel) || x.id;
+      return `<li><span class="path">${escapeHtml(joinPath(state.root, label))}</span>${why ? `<span class="why">${escapeHtml(why)}</span>` : ''}</li>`;
+    };
+    let html = '';
+    if (r.recycled.length) {
+      html += `<div class="ok"><strong>Moved ${r.recycled.length} file${r.recycled.length === 1 ? '' : 's'} to the Recycle Bin:</strong>`
+        + `<ul>${r.recycled.map((x) => item(x)).join('')}</ul></div>`;
+    }
+    if (r.failed.length) {
+      html += `<div class="bad"><strong>${r.failed.length} file${r.failed.length === 1 ? ' was' : 's were'} not moved and ${r.failed.length === 1 ? 'is' : 'are'} still in place:</strong>`
+        + `<ul>${r.failed.map((x) => item(x, x.error)).join('')}</ul></div>`;
+    }
+    if (!r.recycled.length && !r.failed.length) html = '<div class="ok">Nothing was moved.</div>';
+    if (r.warning) html += `<div class="bad">${escapeHtml(r.warning)}</div>`;
+    html += '<button type="button" class="btn ghost small" data-dismiss-report>Hide this report</button>';
+    el.dupReport.innerHTML = html;
+    el.dupReport.hidden = false;
+  }
+
+  function toggleKeep(id, keep) {
+    const g = dup.groups.find((x) => x.ids.includes(id));
+    if (!g) return;
+    if (keep) dup.keep.add(id);
+    else {
+      const others = liveIds(g).filter((x) => x !== id && dup.keep.has(x));
+      if (!others.length) {
+        toast('Keep at least one copy in each group. Tick Keep on another copy first.', 'error');
+        const box = el.dupGroups.querySelector(`input[data-keep="${id}"]`);
+        if (box) box.checked = true;
+        return;
+      }
+      dup.keep.delete(id);
+    }
+    const li = el.dupGroups.querySelector(`.dup-file[data-id="${id}"]`);
+    if (li) {
+      li.classList.toggle('remove', !keep);
+      const tag = li.querySelector('.dup-tag');
+      tag.className = 'dup-tag ' + (keep ? 'keep' : 'del');
+      tag.textContent = keep ? 'Keep' : 'To Recycle Bin';
+    }
+    updateDupSummary();
+  }
+
+  function askDeleteDuplicates() {
+    const remove = toRemove();
+    if (!remove.length) return;
+    const bytes = remove.reduce((n, id) => n + (state.byId.get(id).size || 0), 0);
+    el.dupConfirmLead.textContent = `${remove.length} file${remove.length === 1 ? '' : 's'} (${fmtSize(bytes)}) will be moved to the Recycle Bin:`;
+    el.dupConfirmList.innerHTML = remove.map((id) => `<li>${escapeHtml(joinPath(state.root, state.byId.get(id).rel))}</li>`).join('');
+    el.btnDupConfirm.disabled = false;
+    el.btnDupConfirmCancel.disabled = false;
+    el.dupConfirmDialog.showModal();
+    el.btnDupConfirmCancel.focus();  // Enter = Cancel
+  }
+
+  async function confirmDeleteDuplicates() {
+    const remove = toRemove();
+    if (!remove.length) { el.dupConfirmDialog.close(); return; }
+    el.btnDupConfirm.disabled = true;
+    el.btnDupConfirmCancel.disabled = true;
+    if (remove.includes(state.currentId)) {  // the browser mustn't hold a file it's about to recycle
+      el.viewer.removeAttribute('src');
+      el.viewer.dataset.id = '';
+    }
+    setBusy(true, `Moving ${remove.length} cop${remove.length === 1 ? 'y' : 'ies'} to the Recycle Bin…`);
+    let result;
+    try {
+      result = await api('/api/delete-duplicates', { remove, confirm: 'move-duplicates-to-recycle-bin' });
+    } catch (e) {
+      setBusy(false);
+      el.dupConfirmDialog.close();
+      toast(`${e.message} Click Scan to see which files are still in the folder.`, 'error');
+      if (state.currentId) select(state.currentId);
+      return;
+    }
+    setBusy(false);
+    el.dupConfirmDialog.close();
+    for (const r of result.recycled) {
+      const f = state.byId.get(r.id);
+      if (f) { f.status = 'deleted'; f.ghost = true; dup.keep.delete(r.id); }
+    }
+    dup.report = result;
+    rebuild();
+    if (state.currentId) {
+      if (state.view.includes(state.currentId)) select(state.currentId);
+      else select(state.view.find((id) => !state.byId.get(id).ghost) || null);
+    }
+    renderDuplicates();
+    el.dupReport.scrollIntoView({ block: 'start' });
+    const n = result.recycled.length, k = result.failed.length;
+    toast(k ? `Moved ${n} to the Recycle Bin. ${k} could not be moved. See the list for details.`
+      : `Moved ${n} duplicate cop${n === 1 ? 'y' : 'ies'} to the Recycle Bin.`, k ? 'error' : 'info', { duration: 9000 });
+  }
+
   // ------------------------------------------------------------------ scanning
 
   async function scan(folder, recursive) {
@@ -442,6 +727,7 @@
       state.files = data.files;
       state.byId = new Map(data.files.map((f) => [f.id, f]));
       state.currentId = null;
+      dup.groups = []; dup.keep = new Set(); dup.report = null; dup.root = null;
       el.folderInput.value = data.root;
       el.chkRecursive.checked = data.recursive;
       el.welcome.hidden = true;
@@ -548,8 +834,43 @@
     el.btnFiles.addEventListener('click', () => document.body.classList.toggle('drawer-open'));
     el.scrim.addEventListener('click', () => document.body.classList.remove('drawer-open'));
 
+    el.btnReveal.addEventListener('click', () => reveal());
+    el.btnRevealBar.addEventListener('click', () => reveal());
+
+    el.btnDupes.addEventListener('click', openDuplicates);
+    el.btnDupClose.addEventListener('click', () => el.dupDialog.close());
+    el.btnDupCancel.addEventListener('click', () => api('/api/duplicates/cancel').catch(() => {}));
+    el.btnDupRescan.addEventListener('click', startDuplicateSearch);
+    el.btnDupDelete.addEventListener('click', askDeleteDuplicates);
+    el.btnDupConfirm.addEventListener('click', confirmDeleteDuplicates);
+    el.btnDupSuggest.addEventListener('click', () => {
+      dup.keep = new Set(dup.groups.map((g) => liveIds(g)).filter((ids) => ids.length > 1).map(suggestedKeeper));
+      renderDuplicates();
+    });
+    el.btnDupKeepAll.addEventListener('click', () => {
+      for (const g of dup.groups) for (const id of liveIds(g)) dup.keep.add(id);
+      renderDuplicates();
+    });
+    el.dupGroups.addEventListener('change', (e) => {
+      const box = e.target.closest('input[data-keep]');
+      if (box) toggleKeep(box.dataset.keep, box.checked);
+    });
+    el.dupDialog.addEventListener('click', (e) => {
+      const r = e.target.closest('[data-reveal]');
+      if (r) { reveal(r.dataset.reveal); return; }
+      const v = e.target.closest('[data-view]');
+      if (v) {
+        el.dupDialog.close();
+        if (!state.view.includes(v.dataset.view)) { state.filter = 'all'; el.filter.value = 'all'; state.query = ''; el.search.value = ''; rebuild(); }
+        select(v.dataset.view);
+        toast('Click Find duplicates to go back to the list. Your choices are kept.');
+        return;
+      }
+      if (e.target.closest('[data-dismiss-report]')) { dup.report = null; renderDuplicates(); }
+    });
+
     document.addEventListener('keydown', (e) => {
-      if (el.dialog.open) return;  // the dialog handles its own keys (Esc = cancel)
+      if (anyDialogOpen()) return;  // dialogs handle their own keys (Esc = cancel)
       const t = e.target;
       if (t.closest && t.closest('input, select, textarea')) {
         if (e.key === 'Escape') t.blur();
@@ -563,6 +884,7 @@
         d: askDelete,
         Delete: askDelete,
         u: () => { const f = current(); if (f && f.status && !f.ghost) setStatus(null, { advance: false }); },
+        o: () => reveal(),
         ArrowRight: () => move(1), ArrowDown: () => move(1), j: () => move(1),
         ArrowLeft: () => move(-1), ArrowUp: () => move(-1),
         '/': () => el.search.focus(),
@@ -578,7 +900,8 @@
   async function init() {
     bind();
     try {
-      const { settings } = await api('/api/state');
+      const { settings, version } = await api('/api/state');
+      if (version) el.appVersion.textContent = `PDF Cleaner ${version}`;
       if (typeof settings.recursive === 'boolean') el.chkRecursive.checked = settings.recursive;
       if (settings.lastFolder) {
         el.folderInput.value = settings.lastFolder;
