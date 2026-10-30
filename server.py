@@ -9,6 +9,8 @@ Safety model:
   * Removes a file only by moving it to the Windows Recycle Bin, only after the
     browser sends an explicit confirmation, and only for .pdf files inside the
     folder that was scanned. Folders and other file types are never touched.
+  * Batch removal of duplicates always keeps at least one copy of every group,
+    and re-checks each file's contents just before it is recycled.
 """
 from __future__ import annotations
 
@@ -32,13 +34,42 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
 APP_NAME = "PDF Cleaner"
+__version__ = "1.1.0"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FROZEN = bool(getattr(sys, "frozen", False))  # running as the packaged PDFCleaner.exe
+
+
+def app_dir() -> str:
+    """Where the program's own files live (read-only). Inside the .exe, PyInstaller unpacks them to _MEIPASS."""
+    if FROZEN and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def user_data_dir() -> str:
+    """Where saved progress lives: %LOCALAPPDATA%\\PDF Cleaner on Windows.
+
+    PDF_CLEANER_DATA_DIR overrides it (used by the tests, and for portable setups).
+    """
+    override = os.environ.get("PDF_CLEANER_DATA_DIR")
+    if override:
+        return os.path.abspath(override)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, APP_NAME)
+
+
+APP_DIR = app_dir()
 STATIC_DIR = os.path.join(APP_DIR, "static")
-DATA_DIR = os.path.join(APP_DIR, "data")
+DATA_DIR = user_data_dir()
 PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
+# v1.0 kept progress in data/ next to server.py. It is copied (never moved) to DATA_DIR on first
+# start. The .exe looks for it next to itself, in case it was put in the old PDF Cleaner folder.
+LEGACY_PROGRESS_FILE = os.path.join(os.path.dirname(sys.executable) if FROZEN else APP_DIR, "data", "progress.json")
 
 # A fresh secret per launch. The page receives it; other websites cannot read it,
 # so they cannot send requests to this server.
@@ -49,6 +80,9 @@ MAX_FILES = 25_000
 MAX_PAGECOUNT_BYTES = 512 * 1024 * 1024
 DECISIONS = {"keep", "skip"}
 DELETE_CONFIRM_PHRASE = "move-to-recycle-bin"
+BATCH_DELETE_CONFIRM_PHRASE = "move-duplicates-to-recycle-bin"
+MAX_BATCH_DELETE = 5_000
+HASH_CHUNK = 1 << 20
 
 SKIP_DIR_NAMES = {"$recycle.bin", "system volume information", "$windows.~bt", "$windows.~ws"}
 REPARSE_TAG_MOUNT_POINT = 0xA0000003  # directory junction
@@ -152,6 +186,18 @@ class ProgressStore:
             return folder.setdefault("files", {})
 
 
+def migrate_legacy_progress(legacy: str | None, target: str) -> bool:
+    """Copy v1.0's data/progress.json to the user data folder, once. The original is left in place."""
+    if not legacy or os.path.exists(target) or not os.path.isfile(legacy):
+        return False
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = target + ".tmp"
+    with open(legacy, "rb") as src, open(tmp, "wb") as dst:
+        dst.write(src.read())
+    os.replace(tmp, target)
+    return True
+
+
 class ScanSession:
     """The most recent scan. File operations are only allowed on files listed here."""
 
@@ -159,6 +205,7 @@ class ScanSession:
         self.lock = threading.Lock()
         self.root: str | None = None
         self.files: dict[str, dict] = {}
+        self.generation = 0  # bumps on every scan, so stale duplicate results are never acted on
 
 
 STORE = ProgressStore(PROGRESS_FILE)
@@ -435,6 +482,214 @@ def move_to_recycle_bin(path: str) -> None:
                             "It may be open in another program or read-only.")
 
 
+def recycle_scanned_file(fid: str, path: str, entry: dict, root: str, save: bool = True) -> dict:
+    """Recycle one file from the current scan and remember it as 'deleted'. Raises ApiError on failure."""
+    st = os.stat(path)
+    pages = page_count_cached(path, allow_cloud=False)
+    move_to_recycle_bin(path)
+    if os.path.lexists(path):
+        raise ApiError(500, "Windows reported success but the file is still there. Nothing else was changed.")
+    with STORE.lock:
+        STORE.records(root)[os.path.normcase(entry["rel"])] = {
+            "rel": entry["rel"], "status": "deleted", "at": time.time(),
+            "size": st.st_size, "mtime": st.st_mtime, "pages": pages,
+        }
+    if save:
+        STORE.save()
+    with SESSION.lock:
+        SESSION.files.pop(fid, None)
+    return {"id": fid, "rel": entry["rel"]}
+
+
+# --------------------------------------------------------------------------- duplicate finder (read-only)
+
+HASH_CACHE: dict = {}
+HASH_CACHE_LOCK = threading.Lock()
+
+
+class Cancelled(Exception):
+    pass
+
+
+def sha256_file(path: str, cancel: threading.Event | None = None, on_bytes=None) -> str:
+    """SHA-256 of a file's contents, read in chunks. Opens the file read-only."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            chunk = fh.read(HASH_CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            if on_bytes:
+                on_bytes(len(chunk))
+    return h.hexdigest()
+
+
+def sha256_cached(path: str, st: os.stat_result, cancel=None, on_bytes=None) -> str:
+    key = (_norm(path), st.st_size, st.st_mtime_ns)
+    with HASH_CACHE_LOCK:
+        if key in HASH_CACHE:
+            if on_bytes:
+                on_bytes(st.st_size)
+            return HASH_CACHE[key]
+    digest = sha256_file(path, cancel, on_bytes)
+    with HASH_CACHE_LOCK:
+        HASH_CACHE[key] = digest
+    return digest
+
+
+class DuplicateJob:
+    """One background duplicate search at a time, over the files of the current scan."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cancel = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.reset()
+
+    def reset(self) -> None:
+        self.state = "idle"          # idle | running | done | cancelled | error
+        self.generation = -1
+        self.root: str | None = None
+        self.phase = ""
+        self.files_done = self.files_total = 0
+        self.bytes_done = self.bytes_total = 0
+        self.scanned = 0
+        self.skipped_cloud = 0
+        self.unreadable = 0
+        self.groups: list[dict] = []
+        self.rels: dict[str, str] = {}
+        self.error = ""
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "state": self.state, "phase": self.phase, "generation": self.generation,
+                "filesDone": self.files_done, "filesTotal": self.files_total,
+                "bytesDone": self.bytes_done, "bytesTotal": self.bytes_total,
+                "scanned": self.scanned, "skippedCloud": self.skipped_cloud, "unreadable": self.unreadable,
+                "groups": [dict(g, ids=list(g["ids"])) for g in self.groups] if self.state == "done" else [],
+                "error": self.error,
+            }
+
+
+DUP_JOB = DuplicateJob()
+
+
+def find_duplicate_groups(entries: dict, job: DuplicateJob | None = None) -> list[dict]:
+    """Group files with identical contents.
+
+    Step 1: group by exact size (cheap; a file with a unique size can't have a duplicate).
+    Step 2: SHA-256 only the files that share a size, and group by hash.
+    Cloud-only (OneDrive online-only) files are skipped, so nothing is downloaded.
+    """
+    cancel = job.cancel if job else None
+    by_size: dict[int, list] = {}
+    scanned = skipped_cloud = unreadable = 0
+    for fid, entry in entries.items():
+        path = entry["path"]
+        try:
+            st = os.lstat(path)
+        except OSError:
+            unreadable += 1
+            continue
+        if not stat.S_ISREG(st.st_mode) or is_link_like(st):
+            continue
+        if is_cloud_only(st):
+            skipped_cloud += 1
+            continue
+        scanned += 1
+        by_size.setdefault(st.st_size, []).append((fid, path, st))
+
+    candidates = [c for same in by_size.values() if len(same) > 1 for c in same]
+    if job:
+        with job.lock:
+            job.phase = "hashing"
+            job.scanned, job.skipped_cloud = scanned, skipped_cloud
+            job.files_total = len(candidates)
+            job.bytes_total = sum(c[2].st_size for c in candidates)
+
+    def on_bytes(n: int) -> None:
+        if job:
+            with job.lock:
+                job.bytes_done += n
+
+    by_hash: dict[tuple, list] = {}
+    for fid, path, st in candidates:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
+        try:
+            digest = sha256_cached(path, st, cancel, on_bytes)
+        except OSError:
+            unreadable += 1
+            digest = None
+        if job:
+            with job.lock:
+                job.files_done += 1
+                job.unreadable = unreadable
+        if digest:
+            by_hash.setdefault((st.st_size, digest), []).append(fid)
+
+    groups = [{"size": size, "sha256": digest, "ids": sorted(ids, key=lambda i: entries[i]["rel"].lower())}
+              for (size, digest), ids in by_hash.items() if len(ids) > 1]
+    groups.sort(key=lambda g: (-(g["size"] * (len(g["ids"]) - 1)), entries[g["ids"][0]]["rel"].lower()))
+    if job:
+        with job.lock:
+            job.unreadable = unreadable
+    return groups
+
+
+def _run_duplicate_job(entries: dict) -> None:
+    job = DUP_JOB
+    try:
+        groups = find_duplicate_groups(entries, job)
+        with job.lock:
+            job.groups = groups
+            job.state = "done"
+            job.phase = ""
+    except Cancelled:
+        with job.lock:
+            job.state = "cancelled"
+    except Exception as exc:  # report, never crash the server
+        traceback.print_exc()
+        with job.lock:
+            job.state = "error"
+            job.error = f"Finding duplicates failed: {exc}"
+
+
+# --------------------------------------------------------------------------- show in File Explorer
+
+def reveal_in_explorer(path: str) -> None:
+    """Open File Explorer at the file's folder with the file selected. Never opens or runs the file."""
+    if os.name != "nt":
+        raise ApiError(501, "Showing files in File Explorer is only supported on Windows.")
+    try:
+        ole32, shell32 = ctypes.windll.ole32, ctypes.windll.shell32
+        shell32.ILCreateFromPathW.argtypes = [ctypes.c_wchar_p]
+        shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+        shell32.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+                                                       ctypes.c_ulong]
+        shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+        shell32.ILFree.argtypes = [ctypes.c_void_p]
+        ole32.CoInitialize(None)
+        try:
+            pidl = shell32.ILCreateFromPathW(path)
+            if pidl:
+                try:
+                    if shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0:
+                        return
+                finally:
+                    shell32.ILFree(pidl)
+        finally:
+            ole32.CoUninitialize()
+    except (OSError, AttributeError):
+        pass
+    # Fallback. Windows paths can't contain a double quote, so quoting is safe here.
+    subprocess.Popen(f'explorer.exe /select,"{path}"', creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
 # --------------------------------------------------------------------------- folder picker
 
 PICKER_SCRIPT = r"""
@@ -452,11 +707,38 @@ sys.stdout.write(path or "")
 PICKER_LOCK = threading.Lock()
 
 
+def run_folder_picker(initial: str) -> None:
+    """Child-process entry point inside the .exe (`PDFCleaner.exe --pick-folder <initial>`).
+
+    Same dialog as PICKER_SCRIPT. It runs in its own process so Tk never shares the server's threads.
+    """
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askdirectory(parent=root, title="Choose a folder to scan for PDFs",
+                                   initialdir=initial or None, mustexist=True)
+    root.destroy()
+    sys.stdout.buffer.write((path or "").encode("utf-8"))
+    sys.stdout.flush()
+
+
+def picker_command(initial: str) -> list[str]:
+    if FROZEN:
+        return [sys.executable, "--pick-folder", initial]
+    exe = sys.executable
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(pyw):
+        exe = pyw
+    return [exe, "-I", "-c", PICKER_SCRIPT, initial]
+
+
 # --------------------------------------------------------------------------- API
 
 def api_state(_body):
     with STORE.lock:
-        return {"settings": dict(STORE.data["settings"]), "app": APP_NAME}
+        return {"settings": dict(STORE.data["settings"]), "app": APP_NAME, "version": __version__}
 
 
 def api_pick_folder(body):
@@ -468,11 +750,7 @@ def api_pick_folder(body):
     try:
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        exe = sys.executable
-        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-        if os.path.exists(pyw):
-            exe = pyw
-        proc = subprocess.run([exe, "-I", "-c", PICKER_SCRIPT, initial], capture_output=True,
+        proc = subprocess.run(picker_command(initial), capture_output=True,
                               env=env, timeout=900, creationflags=flags)
         chosen = proc.stdout.decode("utf-8", "replace").strip()
     except subprocess.TimeoutExpired:
@@ -518,6 +796,8 @@ def api_scan(body):
     with SESSION.lock:
         SESSION.root = root
         SESSION.files = {f["id"]: {"path": os.path.join(root, f["rel"]), "rel": f["rel"]} for f in found}
+        SESSION.generation += 1
+    DUP_JOB.cancel.set()  # results from an older scan must never be acted on
     return {"root": root, "recursive": recursive, "files": found + ghosts,
             "truncated": truncated, "limit": MAX_FILES}
 
@@ -559,23 +839,145 @@ def api_delete(body):
     """'Delete' in the UI. Moves the PDF to the Windows Recycle Bin; nothing is erased."""
     if body.get("confirm") != DELETE_CONFIRM_PHRASE:
         raise ApiError(400, "Deletion needs confirmation.")
-    path, entry = resolve_id(body.get("id"))
+    fid = body.get("id")
+    path, entry = resolve_id(fid)
     with SESSION.lock:
         root = SESSION.root
-    st = os.stat(path)
-    pages = page_count_cached(path, allow_cloud=False)
-    move_to_recycle_bin(path)
-    if os.path.lexists(path):
-        raise ApiError(500, "Windows reported success but the file is still there. Nothing else was changed.")
-    with STORE.lock:
-        STORE.records(root)[os.path.normcase(entry["rel"])] = {
-            "rel": entry["rel"], "status": "deleted", "at": time.time(),
-            "size": st.st_size, "mtime": st.st_mtime, "pages": pages,
-        }
-    STORE.save()
-    with SESSION.lock:
-        SESSION.files.pop(body.get("id"), None)
+    recycle_scanned_file(fid, path, entry, root)
     return {"status": "deleted"}
+
+
+def api_reveal(body):
+    """'Show in folder': open File Explorer with this PDF selected."""
+    path, _entry = resolve_id(body.get("id"))
+    reveal_in_explorer(path)
+    return {"path": path}
+
+
+def api_duplicates_start(_body):
+    with SESSION.lock:
+        if not SESSION.root:
+            raise ApiError(400, "Scan a folder first.")
+        entries = {fid: dict(e) for fid, e in SESSION.files.items()}
+        generation, root = SESSION.generation, SESSION.root
+    old = DUP_JOB.thread
+    if old and old.is_alive() and DUP_JOB.generation != generation:
+        DUP_JOB.cancel.set()
+        old.join(5)  # an outdated search stops within one 1 MB chunk
+    with DUP_JOB.lock:
+        if DUP_JOB.thread and DUP_JOB.thread.is_alive():
+            if DUP_JOB.generation == generation:
+                return {"started": False}  # already searching this scan
+            raise ApiError(409, "Still stopping the previous search. Try again in a moment.")
+        DUP_JOB.reset()
+        DUP_JOB.cancel = threading.Event()
+        DUP_JOB.state, DUP_JOB.phase = "running", "sizing"
+        DUP_JOB.generation, DUP_JOB.root = generation, root
+        DUP_JOB.rels = {fid: e["rel"] for fid, e in entries.items()}
+        DUP_JOB.thread = threading.Thread(target=_run_duplicate_job, args=(entries,), daemon=True)
+        DUP_JOB.thread.start()
+    return {"started": True}
+
+
+def api_duplicates_status(_body):
+    snap = DUP_JOB.snapshot()
+    with SESSION.lock:
+        snap["stale"] = snap["generation"] != SESSION.generation
+    return snap
+
+
+def api_duplicates_cancel(_body):
+    DUP_JOB.cancel.set()
+    return {}
+
+
+def api_delete_duplicates(body):
+    """Move chosen duplicate copies to the Recycle Bin, keeping at least one copy of every group.
+
+    All request checks happen before anything is touched. Then each file is re-hashed just before
+    it is recycled. One failure doesn't stop the rest, and the reply lists exactly which files were
+    recycled and which were not (and why).
+    """
+    if body.get("confirm") != BATCH_DELETE_CONFIRM_PHRASE:
+        raise ApiError(400, "Deletion needs confirmation.")
+    remove = body.get("remove")
+    if (not isinstance(remove, list) or not remove or len(remove) > MAX_BATCH_DELETE
+            or not all(isinstance(i, str) and re.fullmatch(r"[0-9a-f]{16}", i) for i in remove)):
+        raise ApiError(400, "Invalid request.")
+    remove_set = set(remove)
+
+    with SESSION.lock:
+        generation, root = SESSION.generation, SESSION.root
+    with DUP_JOB.lock:
+        if DUP_JOB.state != "done" or DUP_JOB.generation != generation:
+            raise ApiError(409, "These duplicate results are out of date. Click Find duplicates again.")
+        groups = [dict(g, ids=list(g["ids"])) for g in DUP_JOB.groups]
+        rels = dict(DUP_JOB.rels)
+    group_of = {fid: g for g in groups for fid in g["ids"]}
+
+    unknown = [i for i in remove_set if i not in group_of]
+    if unknown:
+        raise ApiError(400, "Some of those files aren't in the duplicate list. Nothing was moved.")
+    plan = []
+    for g in groups:
+        doomed = [i for i in g["ids"] if i in remove_set]
+        if not doomed:
+            continue
+        if len(doomed) >= len(g["ids"]):
+            raise ApiError(400, "Every group must keep at least one copy. Nothing was moved.")
+        plan.append((g, doomed, [i for i in g["ids"] if i not in remove_set]))
+
+    def matches(fid: str, g: dict) -> tuple[str, dict]:
+        path, entry = resolve_id(fid)
+        st = os.stat(path)
+        if st.st_size != g["size"] or sha256_file(path) != g["sha256"]:
+            raise ApiError(409, "This file changed since the duplicate search, so it was left in place.")
+        return path, entry
+
+    recycled, failed = [], []
+
+    def fail(fid: str, message: str) -> None:
+        failed.append({"id": fid, "rel": rels.get(fid), "error": message})
+
+    try:
+        for g, doomed, keepers in plan:
+            keeper_ok = False
+            for k in keepers:  # make sure a copy that stays really is still there, unchanged
+                try:
+                    matches(k, g)
+                    keeper_ok = True
+                    break
+                except Exception:  # noqa: BLE001 (any doubt means: don't touch this group)
+                    continue
+            if not keeper_ok:
+                for fid in doomed:
+                    fail(fid, "The copy you chose to keep is missing or changed, so this group was left alone.")
+                continue
+            for fid in doomed:
+                try:
+                    path, entry = matches(fid, g)
+                    recycled.append(recycle_scanned_file(fid, path, entry, root, save=False))
+                except ApiError as exc:
+                    fail(fid, exc.message)
+                except OSError as exc:
+                    fail(fid, f"File error: {exc.strerror or exc}")
+                except Exception:  # noqa: BLE001 (keep going so the report stays exact)
+                    traceback.print_exc()
+                    fail(fid, "Unexpected error. See the PDF Cleaner window for details.")
+    finally:
+        warning = None
+        if recycled:
+            try:
+                STORE.save()
+            except OSError as exc:  # the files did move; say so rather than hide the report
+                warning = f"The files were moved, but saved progress couldn't be updated: {exc.strerror or exc}"
+            gone = {r["id"] for r in recycled}
+            with DUP_JOB.lock:
+                if DUP_JOB.generation == generation:
+                    for g in DUP_JOB.groups:
+                        g["ids"] = [i for i in g["ids"] if i not in gone]
+                    DUP_JOB.groups = [g for g in DUP_JOB.groups if len(g["ids"]) > 1]
+    return {"recycled": recycled, "failed": failed, "warning": warning}
 
 
 ROUTES = {
@@ -585,13 +987,18 @@ ROUTES = {
     "/api/pages": api_pages,
     "/api/status": api_status,
     "/api/delete": api_delete,
+    "/api/reveal": api_reveal,
+    "/api/duplicates/start": api_duplicates_start,
+    "/api/duplicates/status": api_duplicates_status,
+    "/api/duplicates/cancel": api_duplicates_cancel,
+    "/api/delete-duplicates": api_delete_duplicates,
 }
 
 
 # --------------------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PDFCleaner/1.0"
+    server_version = f"PDFCleaner/{__version__}"
     sys_version = ""
     protocol_version = "HTTP/1.1"
 
@@ -781,25 +1188,49 @@ class LocalServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+def pause_if_double_clicked() -> None:
+    """Keep the console open after an error when the .exe was started by double-click."""
+    if FROZEN and os.name == "nt":
+        try:
+            input("  Press Enter to close this window.")
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
 def main() -> None:
+    global STORE
+    if len(sys.argv) >= 2 and sys.argv[1] == "--pick-folder":  # child process for the folder dialog
+        run_folder_picker(sys.argv[2] if len(sys.argv) > 2 else "")
+        return
+
     parser = argparse.ArgumentParser(description="PDF Cleaner - review local PDFs privately.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="port to use (default 8765)")
     parser.add_argument("--no-browser", action="store_true", help="don't open the browser automatically")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     args = parser.parse_args()
 
     try:
         lock = acquire_instance_lock(DATA_DIR)  # noqa: F841 (held open until exit)
     except OSError as exc:
-        print(f"\n  PDF Cleaner can't save its progress in this folder ({exc.strerror or exc}).\n"
-              "  Move the whole PDF Cleaner folder somewhere you can write to, such as\n"
-              "  Documents or the Desktop, and start it again.\n", file=sys.stderr)
+        print(f"\n  PDF Cleaner can't save its progress in {DATA_DIR}\n  ({exc.strerror or exc}).\n"
+              "  Check that your user folder isn't full or read-only, then start it again.\n",
+              file=sys.stderr)
+        pause_if_double_clicked()
         sys.exit(1)
     if lock is None:
-        print("\n  PDF Cleaner is already running from this folder.\n"
+        print("\n  PDF Cleaner is already running.\n"
               "  Use the browser tab that's already open, or close the other PDF Cleaner\n"
               "  window first. (Two copies would overwrite each other's saved progress.)\n",
               file=sys.stderr)
+        pause_if_double_clicked()
         sys.exit(1)
+
+    try:
+        if migrate_legacy_progress(LEGACY_PROGRESS_FILE, PROGRESS_FILE):
+            print(f"  Copied your saved progress from {LEGACY_PROGRESS_FILE}\n  to {PROGRESS_FILE}.")
+    except OSError as exc:
+        print(f"Warning: couldn't copy saved progress from {LEGACY_PROGRESS_FILE} ({exc}).", file=sys.stderr)
+    STORE = ProgressStore(PROGRESS_FILE)
 
     server = None
     for port in range(args.port, args.port + 20):
@@ -810,10 +1241,12 @@ def main() -> None:
             continue
     if server is None:
         print(f"Could not find a free port near {args.port}.", file=sys.stderr)
+        pause_if_double_clicked()
         sys.exit(1)
 
     url = f"http://{HOST}:{server.server_address[1]}/"
-    print(f"\n  {APP_NAME} is running at {url}")
+    print(f"\n  {APP_NAME} {__version__} is running at {url}")
+    print(f"  Saved progress: {PROGRESS_FILE}")
     print("  It only accepts connections from this computer.")
     print("  Keep this window open while you use it. Press Ctrl+C to stop.\n")
     if not args.no_browser:

@@ -74,7 +74,13 @@
           </button>
         </div>
       </div>
-      <div class="list-meta" id="listMeta"></div>
+      <div class="list-meta">
+        <span id="listMeta"></span>
+        <button type="button" class="btn ghost small" id="btnDupes" hidden title="Find PDFs with exactly the same contents">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>
+          Find duplicates
+        </button>
+      </div>
       <ul class="file-list" id="fileList" role="listbox" aria-label="PDF files"></ul>
     </aside>
     <div class="scrim only-narrow" id="scrim"></div>
@@ -104,6 +110,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
           </button>
           <span class="viewer-title" id="viewerTitle"></span>
+          <button type="button" class="btn ghost small" id="btnRevealBar" title="Show this file in File Explorer (O)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="m10 11 3 2.5-3 2.5"/></svg>
+            <span>Show in folder</span>
+          </button>
           <a class="btn ghost small" id="btnOpenTab" target="_blank" rel="noopener" title="Open in a new tab">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>
             New tab
@@ -127,6 +137,10 @@
         <div><dt>Modified</dt><dd id="dModified"></dd></div>
         <div class="wide"><dt>Location</dt><dd id="dLocation" class="path"></dd></div>
       </dl>
+      <button type="button" class="btn small reveal" id="btnReveal" title="Open File Explorer with this file selected (O)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="m10 11 3 2.5-3 2.5"/></svg>
+        Show in folder <kbd>O</kbd>
+      </button>
 
       <div class="actions" id="actions">
         <button type="button" class="act keep" id="btnKeep">
@@ -152,6 +166,7 @@
         <p>Delete moves the file to the Windows Recycle Bin. Nothing is permanently deleted.</p>
         <p><kbd>←</kbd> <kbd>→</kbd> previous / next &nbsp; <kbd>/</kbd> search</p>
         <p>Shortcuts work when the PDF isn't focused. Click outside it first.</p>
+        <p class="version" id="appVersion"></p>
       </div>
     </aside>
   </div>
@@ -168,6 +183,57 @@
       <div class="dialog-actions">
         <button type="submit" value="cancel" class="btn" id="btnCancelDelete">Cancel</button>
         <button type="button" class="btn danger" id="btnConfirmDelete">Move to Recycle Bin</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dupDialog" class="dialog dup-dialog" aria-labelledby="dupTitle">
+    <div class="dup-head">
+      <div>
+        <h3 id="dupTitle">Duplicate PDFs</h3>
+        <p class="dup-lead">Files with exactly the same contents, whatever their names. Nothing is moved until you confirm.</p>
+      </div>
+      <button type="button" class="icon-btn" id="btnDupClose" aria-label="Close" title="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+
+    <div class="dup-body" id="dupBody">
+      <div class="dup-progress" id="dupProgress" hidden>
+        <p id="dupProgressText">Checking file sizes…</p>
+        <div class="dup-bar"><span id="dupBar"></span></div>
+        <button type="button" class="btn small" id="btnDupCancel">Stop</button>
+      </div>
+      <div class="dup-empty" id="dupEmpty" hidden></div>
+      <div class="dup-report" id="dupReport" hidden></div>
+      <div class="dup-toolbar" id="dupToolbar" hidden>
+        <span id="dupSummary"></span>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost small" id="btnDupSuggest" title="In every group, keep the oldest copy">Keep oldest in each group</button>
+        <button type="button" class="btn ghost small" id="btnDupKeepAll">Keep everything</button>
+      </div>
+      <div class="dup-groups" id="dupGroups"></div>
+    </div>
+
+    <div class="dup-foot" id="dupFoot" hidden>
+      <span class="dup-foot-note" id="dupFootNote"></span>
+      <button type="button" class="btn" id="btnDupRescan">Search again</button>
+      <button type="button" class="btn danger" id="btnDupDelete" disabled>Move copies to Recycle Bin</button>
+    </div>
+  </dialog>
+
+  <dialog id="dupConfirmDialog" class="dialog" aria-labelledby="dupConfirmTitle">
+    <form method="dialog">
+      <div class="dialog-head">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>
+        <h3 id="dupConfirmTitle">Move duplicate copies to the Recycle Bin?</h3>
+      </div>
+      <p class="confirm-note" id="dupConfirmLead"></p>
+      <ul class="dup-confirm-list path" id="dupConfirmList"></ul>
+      <p class="confirm-note">At least one copy of each file stays where it is. You can restore the others from the Recycle Bin later. Nothing is permanently deleted.</p>
+      <div class="dialog-actions">
+        <button type="submit" value="cancel" class="btn" id="btnDupConfirmCancel">Cancel</button>
+        <button type="button" class="btn danger" id="btnDupConfirm">Move to Recycle Bin</button>
       </div>
     </form>
   </dialog>
