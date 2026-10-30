@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# Personal data: never commit
+# ---------------------------------------------------------------------------
+
+# Saved review decisions (contains your file names and folder paths)
+data/
+progress.json
+progress.json.*
+
+# Any PDF anywhere in the repository. Screenshots use JPG, and tests generate PDFs at runtime.
+*.pdf
+*.PDF
+*.Pdf
+
+# Common places people drop test documents
+samples/
+sample-pdfs/
+my-pdfs/
+pdfs/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Temporary and editor files
+# ---------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.log
+*.swp
+*~
+.~lock.*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.code-workspace
+
+# Local AI-assistant and tooling settings (may contain local paths)
+.claude/
+.impeccable/
+CLAUDE.local.md
+
+# Secrets, in case any are ever added locally
+.env
+.env.*
+*.pem
+*.key
